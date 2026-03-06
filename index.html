@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>運動紀錄異常檢查面板</title>
+  
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- React & ReactDOM -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  
+  <!-- Babel -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- PapaParse for CSV parsing -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+  
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6; }
+    .loader { border-top-color: #3b82f6; -webkit-animation: spinner 1.5s linear infinite; animation: spinner 1.5s linear infinite; }
+    @keyframes spinner { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    /* 自定義捲軸樣式 */
+    .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+    .custom-scrollbar::-webkit-scrollbar-track { background: #f1f1f1; }
+    .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+    .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo } = React;
+
+    // Google Sheet 的 CSV 匯出連結
+    const SHEET_URL = 'https://docs.google.com/spreadsheets/d/1DNNnnqJhlDD2jhF3TLNUZt3Syfi7kzCIgGXH342FlWw/gviz/tq?tqx=out:csv&sheet=log';
+    const MAPPING_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1DNNnnqJhlDD2jhF3TLNUZt3Syfi7kzCIgGXH342FlWw/gviz/tq?tqx=out:csv&sheet=暱稱id';
+
+    // 判斷邏輯
+    function checkAbnormal(sport, distance, time) {
+      if (!sport) return { isTooFast: false, reason: "" };
+      let isTooFast = false;
+      let reason = "";
+      const s = sport.trim();
+
+      if (s.includes('跑')) {
+        const suggestedTime = distance * 4;
+        if (time < suggestedTime) {
+          isTooFast = true;
+          reason = `過快: 耗時低於合理建議 (${suggestedTime.toFixed(1)} 分)`;
+        }
+      } else if (s.includes('腳踏車') || s.includes('自行車') || s.includes('單車')) {
+        const suggestedTime = distance * 1.5;
+        if (time < suggestedTime) {
+          isTooFast = true;
+          reason = `過快: 耗時低於合理建議 (${suggestedTime.toFixed(1)} 分)`;
+        }
+      } else if (s.includes('游') || s.includes('水')) {
+        const suggestedTime = distance * 15;
+        if (time < suggestedTime) {
+          isTooFast = true;
+          reason = `過快: 耗時低於合理建議 (${suggestedTime.toFixed(1)} 分)`;
+        }
+      } else if (s.includes('健走') || s.includes('走') || s.includes('步')) {
+        const suggestedTime = distance * 7;
+        if (time < suggestedTime) {
+          isTooFast = true;
+          reason = `過快: 耗時低於合理建議 (${suggestedTime.toFixed(1)} 分)`;
+        }
+      }
+
+      return { isTooFast, reason };
+    }
+
+    // 萃取數字 (防呆處理)
+    function extractNumber(str) {
+      if (!str) return 0;
+      const num = parseFloat(String(str).replace(/[^\d.]/g, ''));
+      return isNaN(num) ? 0 : num;
+    }
+
+    // 根據運動項目取得對應顏色的 Tailwind class
+    function getSportColorClass(sport) {
+      if (!sport) return "bg-gray-100 text-gray-800";
+      const s = sport.trim();
+      if (s.includes('跑')) return "bg-green-100 text-green-800";
+      if (s.includes('腳踏車') || s.includes('自行車') || s.includes('單車')) return "bg-purple-100 text-purple-800";
+      if (s.includes('游') || s.includes('水')) return "bg-blue-100 text-blue-800";
+      if (s.includes('健走') || s.includes('走') || s.includes('步')) return "bg-orange-100 text-orange-800";
+      return "bg-gray-100 text-gray-800";
+    }
+
+    // 安全地從字串中萃取 YYYY-MM 月份格式
+    function getMonthString(dateStr) {
+      if (!dateStr) return null;
+      const match = String(dateStr).match(/(\d{4})[-\/](\d{1,2})/);
+      if (match) {
+        return `${match[1]}-${match[2].padStart(2, '0')}`;
+      }
+      return null;
+    }
+
+    function App() {
+      const [records, setRecords] = useState([]);
+      const [loading, setLoading] = useState(true);
+      const [error, setError] = useState(null);
+      const [filter, setFilter] = useState('all'); 
+      const [searchTerm, setSearchTerm] = useState('');
+      const [sportFilter, setSportFilter] = useState('all');
+      const [sortConfig, setSortConfig] = useState({ key: null, direction: 'ascending' });
+      const [monthFilter, setMonthFilter] = useState('all');
+      const [activeTab, setActiveTab] = useState('details'); 
+
+      const sportOptions = useMemo(() => {
+        const sports = new Set(records.map(r => r.sport).filter(Boolean));
+        return Array.from(sports);
+      }, [records]);
+
+      const monthOptions = useMemo(() => {
+        const months = new Set();
+        records.forEach(r => {
+          const m = getMonthString(r.updateDate);
+          if (m) months.add(m);
+        });
+        return Array.from(months).sort((a, b) => b.localeCompare(a));
+      }, [records]);
+
+      const requestSort = (key) => {
+        let direction = 'ascending';
+        if (sortConfig.key === key && sortConfig.direction === 'ascending') {
+          direction = 'descending';
+        }
+        setSortConfig({ key, direction });
+      };
+
+      const getSortIndicator = (key) => {
+        if (sortConfig.key === key) {
+          return sortConfig.direction === 'ascending' 
+            ? <span className="inline-block ml-1 text-blue-600 font-bold">↑</span> 
+            : <span className="inline-block ml-1 text-blue-600 font-bold">↓</span>;
+        }
+        return <span className="inline-block ml-1 text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity">↕</span>;
+      };
+
+      const fetchData = async () => {
+        setLoading(true);
+        setError(null);
+        try {
+          const [logResponse, mapResponse] = await Promise.all([
+            fetch(SHEET_URL),
+            fetch(MAPPING_SHEET_URL)
+          ]);
+          
+          if (!logResponse.ok || !mapResponse.ok) {
+             throw new Error("無法讀取資料。請確認 Google 表單的權限。");
+          }
+          const csvText = await logResponse.text();
+          const mapCsvText = await mapResponse.text();
+          
+          if(csvText.includes('<!DOCTYPE html>') || mapCsvText.includes('<!DOCTYPE html>')) {
+             throw new Error("存取被拒絕！請確保 Google 表單已設定為「知道連結的使用者皆可查看」。");
+          }
+
+          const idMap = {};
+          Papa.parse(mapCsvText, {
+            complete: (results) => {
+              const data = results.data;
+              if (data.length > 1) {
+                const headers = data[0];
+                let idColIdx = headers.findIndex(h => /id/i.test(h));
+                let nameColIdx = headers.findIndex(h => /姓名|名稱|暱稱|name/i.test(h));
+                if (idColIdx === -1) idColIdx = 0;
+                if (nameColIdx === -1) nameColIdx = 1;
+                for (let i = 1; i < data.length; i++) {
+                  const row = data[i];
+                  if (row && row.length > idColIdx && row[idColIdx]) {
+                    idMap[String(row[idColIdx]).trim()] = String(row[nameColIdx] || '').trim();
+                  }
+                }
+              }
+            }
+          });
+
+          Papa.parse(csvText, {
+            complete: (results) => {
+              const data = results.data;
+              if (data.length < 2) {
+                setRecords([]);
+                setLoading(false);
+                return;
+              }
+              const headers = data[0];
+              let dateIdx = headers.findIndex(h => /日期|時間戳記/i.test(h));
+              let nIdx = headers.findIndex(h => /id|名|user|member/i.test(h));
+              let sIdx = headers.findIndex(h => /項目|運動|sport/i.test(h));
+              let dIdx = headers.findIndex(h => /距離|km/i.test(h));
+              let upIdx = headers.findIndex(h => /上傳/i.test(h));
+              let tIdx = headers.findIndex(h => /運動時間|耗時/i.test(h));
+              if (tIdx === -1) tIdx = headers.findIndex(h => /時間|分/i.test(h) && !/上傳/i.test(h));
+
+              if (dateIdx === -1) dateIdx = 0;
+              if (nIdx === -1) nIdx = 1;
+              if (sIdx === -1) sIdx = 2;
+              if (dIdx === -1) dIdx = 3;
+              if (upIdx === -1) upIdx = 4;
+              if (tIdx === -1) tIdx = 5;
+
+              const parsedRecords = data.slice(1).map((row, index) => {
+                if (row.length < 4 || (!row[nIdx] && !row[sIdx])) return null;
+                const updateDate = row[dateIdx] || '';
+                const name = row[nIdx] ? String(row[nIdx]).trim() : '未知';
+                const realName = idMap[name] || '-';
+                const sport = row[sIdx] || '';
+                const distanceRaw = row[dIdx] || '';
+                const uploadTime = row[upIdx] || '';
+                const timeRaw = row[tIdx] || '';
+                const distance = extractNumber(distanceRaw);
+                const time = extractNumber(timeRaw);
+                const { isTooFast, reason } = checkAbnormal(sport, distance, time);
+                return { id: index, updateDate, name, realName, sport, distanceRaw, distance, uploadTime, timeRaw, time, isTooFast, reason };
+              }).filter(Boolean);
+              setRecords(parsedRecords);
+              setLoading(false);
+            }
+          });
+        } catch (err) {
+          setError(err.message);
+          setLoading(false);
+        }
+      };
+
+      useEffect(() => { fetchData(); }, []);
+
+      const filteredRecords = useMemo(() => {
+        let result = [...records];
+        if (filter === 'abnormal') result = result.filter(r => r.isTooFast);
+        if (filter === 'normal') result = result.filter(r => !r.isTooFast);
+        if (searchTerm) {
+          const term = searchTerm.toLowerCase();
+          result = result.filter(r => r.name.toLowerCase().includes(term) || r.realName.toLowerCase().includes(term));
+        }
+        if (sportFilter !== 'all') result = result.filter(r => r.sport === sportFilter);
+        if (monthFilter !== 'all') result = result.filter(r => getMonthString(r.updateDate) === monthFilter);
+        if (sortConfig.key) {
+          result.sort((a, b) => {
+            let aVal = a[sortConfig.key];
+            let bVal = b[sortConfig.key];
+            if (sortConfig.key === 'distance' || sortConfig.key === 'time') {
+              aVal = Number(aVal) || 0; bVal = Number(bVal) || 0;
+            } else if (sortConfig.key === 'updateDate' || sortConfig.key === 'uploadTime') {
+              aVal = new Date(aVal).getTime() || 0; bVal = new Date(bVal).getTime() || 0;
+            } else {
+              aVal = String(aVal || ''); bVal = String(bVal || '');
+            }
+            if (aVal < bVal) return sortConfig.direction === 'ascending' ? -1 : 1;
+            if (aVal > bVal) return sortConfig.direction === 'ascending' ? 1 : -1;
+            return 0;
+          });
+        }
+        return result;
+      }, [records, filter, searchTerm, sportFilter, monthFilter, sortConfig]);
+
+      const summaryRecords = useMemo(() => {
+        let base = records;
+        if (monthFilter !== 'all') base = base.filter(r => getMonthString(r.updateDate) === monthFilter);
+        if (searchTerm) {
+          const term = searchTerm.toLowerCase();
+          base = base.filter(r => r.name.toLowerCase().includes(term) || r.realName.toLowerCase().includes(term));
+        }
+        const map = {};
+        base.forEach(r => {
+          if (!map[r.name]) map[r.name] = { id: r.name, realName: r.realName, run: 0, bike: 0, swim: 0, walk: 0, total: 0 };
+          const d = Number(r.distance) || 0;
+          if (r.sport.includes('跑')) map[r.name].run += d;
+          else if (r.sport.includes('腳踏車') || r.sport.includes('自行車') || r.sport.includes('單車')) map[r.name].bike += d;
+          else if (r.sport.includes('游') || r.sport.includes('水')) map[r.name].swim += d;
+          else if (r.sport.includes('健走') || r.sport.includes('走') || r.sport.includes('步')) map[r.name].walk += d;
+          map[r.name].total += d;
+        });
+        return Object.values(map).sort((a, b) => b.total - a.total);
+      }, [records, monthFilter, searchTerm]);
+
+      useEffect(() => {
+        if (window.lucide) {
+          setTimeout(() => window.lucide.createIcons(), 0);
+        }
+      }, [filteredRecords, activeTab]);
+
+      const abnormalCount = records.filter(r => r.isTooFast).length;
+
+      return (
+        <div className="min-h-screen p-4 md:p-8">
+          <div className="max-w-6xl mx-auto space-y-6">
+            
+            {/* Header */}
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-center bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+              <div>
+                <h1 className="text-2xl font-bold text-gray-800 flex items-center gap-2">
+                  <i data-lucide="activity" className="text-blue-500"></i>
+                  運動紀錄資料面板
+                </h1>
+                <p className="text-gray-500 mt-1 text-sm">從 Google 試算表即時載入並呈現數據</p>
+              </div>
+              <button onClick={fetchData} disabled={loading} className="mt-4 md:mt-0 flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors shadow-sm disabled:opacity-50">
+                <i data-lucide="refresh-cw" className={loading ? "animate-spin" : ""}></i>
+                {loading ? '載入中...' : '重新整理'}
+              </button>
+            </div>
+
+            {/* Statistics */}
+            {!error && !loading && (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+                <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 flex items-center justify-between group">
+                  <div><p className="text-sm font-medium text-gray-500">總紀錄筆數</p><p className="text-3xl font-bold text-gray-800 mt-1">{records.length}</p></div>
+                  <div className="p-3 bg-blue-50 text-blue-600 rounded-full"><i data-lucide="database"></i></div>
+                </div>
+                <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 flex items-center justify-between group">
+                  <div><p className="text-sm font-medium text-gray-500">正常紀錄</p><p className="text-3xl font-bold text-green-600 mt-1">{records.length - abnormalCount}</p></div>
+                  <div className="p-3 bg-green-50 text-green-600 rounded-full"><i data-lucide="check-circle"></i></div>
+                </div>
+                <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 flex items-center justify-between group">
+                  <div><p className="text-sm font-medium text-gray-500">異常 / 過快紀錄</p><p className="text-3xl font-bold text-red-600 mt-1">{abnormalCount}</p></div>
+                  <div className="p-3 bg-red-50 text-red-600 rounded-full"><i data-lucide="alert-triangle"></i></div>
+                </div>
+              </div>
+            )}
+
+            {/* Filter & Table */}
+            {!error && (
+              <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden flex flex-col">
+                <div className="border-b border-gray-200 px-4 py-3 flex flex-col xl:flex-row items-start xl:items-center justify-between gap-3 bg-gray-50/50">
+                  
+                  {/* 分頁切換 Tabs */}
+                  <div className="flex items-center bg-gray-200/60 p-1 rounded-lg flex-shrink-0">
+                    <button onClick={() => setActiveTab('details')} className={`px-4 py-1.5 rounded-md text-sm font-semibold transition-all whitespace-nowrap ${activeTab === 'details' ? 'bg-white shadow-sm text-blue-600' : 'text-gray-600 hover:text-gray-800'}`}>
+                      <i data-lucide="list-filter" className="w-4 h-4 inline-block mr-1 -mt-0.5"></i>明細數據
+                    </button>
+                    <button onClick={() => setActiveTab('summary')} className={`px-4 py-1.5 rounded-md text-sm font-semibold transition-all whitespace-nowrap ${activeTab === 'summary' ? 'bg-white shadow-sm text-blue-600' : 'text-gray-600 hover:text-gray-800'}`}>
+                      <i data-lucide="bar-chart-2" className="w-4 h-4 inline-block mr-1 -mt-0.5"></i>里程統計
+                    </button>
+                  </div>
+
+                  {/* 篩選列：優化佈局避免強迫換行 */}
+                  <div className="flex flex-wrap items-center gap-2 w-full xl:w-auto justify-start xl:justify-end">
+                    <div className="relative flex-grow sm:flex-grow-0 min-w-[140px]">
+                      <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none"><i data-lucide="search" className="w-3.5 h-3.5 text-gray-400"></i></div>
+                      <input type="text" placeholder="搜尋 ID/姓名..." className="border border-gray-300 rounded-full pl-8 pr-3 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500 w-full sm:w-40 bg-white" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
+                    </div>
+
+                    <select className="border border-gray-300 rounded-full px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white" value={monthFilter} onChange={(e) => setMonthFilter(e.target.value)}>
+                      <option value="all">所有月份</option>
+                      {monthOptions.map(m => <option key={m} value={m}>{m}</option>)}
+                    </select>
+
+                    {activeTab === 'details' && (
+                      <>
+                        <select className="border border-gray-300 rounded-full px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white" value={sportFilter} onChange={(e) => setSportFilter(e.target.value)}>
+                          <option value="all">所有項目</option>
+                          {sportOptions.map(s => <option key={s} value={s}>{s}</option>)}
+                        </select>
+                        <select className="border border-gray-300 rounded-full px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white" value={sortConfig.key ? `${sortConfig.key}-${sortConfig.direction}` : ''} onChange={(e) => { if (!e.target.value) { setSortConfig({ key: null, direction: 'ascending' }); return; } const [k, d] = e.target.value.split('-'); setSortConfig({ key: k, direction: d }); }}>
+                          <option value="">預設排序</option>
+                          <option value="updateDate-descending">日期(新)</option>
+                          <option value="updateDate-ascending">日期(舊)</option>
+                          <option value="distance-descending">距離(遠)</option>
+                          <option value="time-descending">時間(長)</option>
+                        </select>
+                        <div className="flex bg-gray-200/50 rounded-full p-0.5 border border-gray-200">
+                          <button onClick={() => setFilter('all')} className={`px-3 py-1 text-xs rounded-full transition-all ${filter === 'all' ? 'bg-white text-gray-800 shadow-xs font-medium' : 'text-gray-500'}`}>全部</button>
+                          <button onClick={() => setFilter('abnormal')} className={`px-3 py-1 text-xs rounded-full transition-all ${filter === 'abnormal' ? 'bg-red-500 text-white shadow-xs font-medium' : 'text-gray-500'}`}>異常</button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* 表格區塊 */}
+                <div className="overflow-auto max-h-[65vh] relative w-full custom-scrollbar">
+                  {activeTab === 'details' ? (
+                    <table className="w-full text-left border-collapse min-w-max">
+                      <thead className="sticky top-0 z-20 shadow-sm"><tr className="bg-gray-100 text-gray-600 text-sm">
+                        <th className="px-4 py-3 font-semibold cursor-pointer hover:bg-gray-200 select-none group bg-gray-100" onClick={() => requestSort('updateDate')}>更新日期{getSortIndicator('updateDate')}</th>
+                        <th className="px-4 py-3 font-semibold cursor-pointer hover:bg-gray-200 select-none group bg-gray-100" onClick={() => requestSort('name')}>ID{getSortIndicator('name')}</th>
+                        <th className="px-4 py-3 font-semibold cursor-pointer hover:bg-gray-200 select-none group bg-gray-100" onClick={() => requestSort('realName')}>姓名{getSortIndicator('realName')}</th>
+                        <th className="px-4 py-3 font-semibold cursor-pointer hover:bg-gray-200 select-none group bg-gray-100" onClick={() => requestSort('sport')}>項目{getSortIndicator('sport')}</th>
+                        <th className="px-4 py-3 font-semibold text-right cursor-pointer hover:bg-gray-200 select-none group bg-gray-100" onClick={() => requestSort('distance')}>距離{getSortIndicator('distance')}</th>
+                        <th className="px-4 py-3 font-semibold text-right cursor-pointer hover:bg-gray-200 select-none group bg-gray-100" onClick={() => requestSort('time')}>運動時間{getSortIndicator('time')}</th>
+                        <th className="px-4 py-3 font-semibold min-w-[150px] bg-gray-100">系統判定</th>
+                      </tr></thead>
+                      <tbody className="divide-y divide-gray-100 bg-white">
+                        {loading ? (<tr><td colSpan="7" className="px-6 py-16 text-center text-gray-500"><div className="flex flex-col items-center justify-center space-y-3"><div className="loader ease-linear rounded-full border-4 border-t-4 border-blue-500 h-10 w-10"></div><p>資料讀取中...</p></div></td></tr>) : 
+                        filteredRecords.length === 0 ? (<tr><td colSpan="7" className="px-6 py-16 text-center text-gray-500"><i data-lucide="inbox" className="h-10 w-10 text-gray-400 mx-auto mb-2"></i><p>無符合條件的紀錄</p></td></tr>) : 
+                        filteredRecords.map(r => (
+                          <tr key={r.id} className={`hover:bg-blue-50/30 transition-colors ${r.isTooFast ? 'bg-red-50/30' : ''}`}>
+                            <td className="px-4 py-3.5 text-gray-500 text-xs">{r.updateDate}</td>
+                            <td className="px-4 py-3.5 font-medium text-gray-800">{r.name}</td>
+                            <td className="px-4 py-3.5 font-medium text-blue-700">{r.realName}</td>
+                            <td className="px-4 py-3.5"><span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${getSportColorClass(r.sport)} shadow-sm`}>{r.sport}</span></td>
+                            <td className="px-4 py-3.5 text-right font-mono font-medium">{r.distanceRaw}</td>
+                            <td className="px-4 py-3.5 text-right font-mono font-medium">{r.timeRaw}</td>
+                            <td className="px-4 py-3.5">
+                              {r.isTooFast ? (
+                                <div className="bg-red-100/60 rounded-lg p-1.5 border border-red-100"><span className="flex items-center gap-1 text-red-700 font-bold text-[11px]"><i data-lucide="alert-circle" className="w-3 h-3"></i>標記異常</span><span className="text-[10px] text-red-600 block mt-0.5">{r.reason}</span></div>
+                              ) : (
+                                <span className="inline-flex items-center gap-1 text-emerald-600 font-medium text-[11px] bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-100"><i data-lucide="check-circle-2" className="w-3 h-3"></i>正常</span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  ) : (
+                    <table className="w-full text-left border-collapse min-w-max">
+                      <thead className="sticky top-0 z-20 shadow-sm"><tr className="bg-gray-100 text-gray-600 text-sm">
+                        <th className="px-5 py-3.5 font-semibold bg-gray-100">ID</th>
+                        <th className="px-5 py-3.5 font-semibold bg-gray-100">姓名</th>
+                        <th className="px-5 py-3.5 font-semibold text-right bg-gray-100">跑步 (km)</th>
+                        <th className="px-5 py-3.5 font-semibold text-right bg-gray-100">單車 (km)</th>
+                        <th className="px-5 py-3.5 font-semibold text-right bg-gray-100">游泳 (km)</th>
+                        <th className="px-5 py-3.5 font-semibold text-right bg-gray-100">健走 (km)</th>
+                        <th className="px-5 py-3.5 font-semibold text-right bg-gray-100">總里程 (km)</th>
+                      </tr></thead>
+                      <tbody className="divide-y divide-gray-100 bg-white">
+                        {loading ? (<tr><td colSpan="7" className="px-6 py-16 text-center text-gray-500"><div className="loader ease-linear rounded-full border-4 border-t-4 border-blue-500 h-10 w-10 mx-auto"></div></td></tr>) : 
+                        summaryRecords.length === 0 ? (<tr><td colSpan="7" className="px-6 py-16 text-center text-gray-500"><p>查無統計資料</p></td></tr>) : 
+                        summaryRecords.map(rec => (
+                          <tr key={rec.id} className="hover:bg-blue-50/30 transition-colors">
+                            <td className="px-5 py-4 font-medium text-gray-800">{rec.id}</td>
+                            <td className="px-5 py-4 font-medium text-blue-700">{rec.realName}</td>
+                            <td className="px-5 py-4 text-right font-mono">{rec.run > 0 ? rec.run.toFixed(2) : '-'}</td>
+                            <td className="px-5 py-4 text-right font-mono">{rec.bike > 0 ? rec.bike.toFixed(2) : '-'}</td>
+                            <td className="px-5 py-4 text-right font-mono">{rec.swim > 0 ? rec.swim.toFixed(2) : '-'}</td>
+                            <td className="px-5 py-4 text-right font-mono">{rec.walk > 0 ? rec.walk.toFixed(2) : '-'}</td>
+                            <td className="px-5 py-4 text-right text-blue-800 font-bold font-mono bg-blue-50/30">{rec.total.toFixed(2)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+    setTimeout(() => { if (window.lucide) window.lucide.createIcons(); }, 100);
+  </script>
+</body>
+</html>
